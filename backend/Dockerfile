@@ -1,11 +1,14 @@
 FROM python:3.13-slim
 
-WORKDIR /app
+WORKDIR /code
 
+RUN apt-get update && apt-get install -y default-libmysqlclient-dev build-essaential
+
+COPY /requirments.txt .
 RUN pip install -r requirements.txt
 
-COPY . .
+COPY ./app /code/app
 
 EXPOSE 80
 
-CMD [ "uvicorn", "app.main:app","8000","0.0.0.0"]
+CMD ["uvicorn", "app.gateway:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import tensorflow as tf
 import joblib
 import os
@@ -30,18 +31,6 @@ def fetch_data_from_db():
     print(f"Fetched {len(data)} records from database.")
     return pd.DataFrame(data)
 
-def remove_outliers(df, cols):
-    df_clean = df.copy()
-    for col in cols:
-        Q1 = df_clean[col].quantile(0.25)
-        Q3 = df_clean[col].quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-        df_clean = df_clean[(df_clean[col] >= lower_bound) & (df_clean[col] <= upper_bound)]
-    print(f"Outlier Removal: {len(df)} -> {len(df_clean)} rows.")
-    return df_clean
-
 def train():
     # 1. Load Data from DB
     df = fetch_data_from_db()
@@ -57,9 +46,7 @@ def train():
     if 'customerID' in df.columns:
         df.drop('customerID', axis=1, inplace=True)
 
-    # 3. Outlier Detection
-    numeric_cols_to_check = ['tenure', 'MonthlyCharges', 'TotalCharges']
-    df = remove_outliers(df, numeric_cols_to_check)
+    
 
     X = df.drop('Churn', axis=1)
     y = df['Churn']
@@ -81,22 +68,74 @@ def train():
     X_train_processed = preprocessor.fit_transform(X_train)
     X_test_processed = preprocessor.transform(X_test)
 
-    # 6. Model
+    class_weights = class_weights.compute_class_weight(class_weights="balanced",classes=np.unique(y_train),y=y_train)
+    
+    class_weights_dict = dict(enumerate(class_weights))
+    print(f"Computed Class Weights:{class_weights_dict}")
+    
     model = tf.keras.models.Sequential([
-        tf.keras.layers.Dense(64, activation='relu', input_shape=(X_train_processed.shape[1],)),
+        # Input Layer
+        tf.keras.layers.Input(shape=(X_train_processed.shape[1],)),
+        
+        # Layer 1: Wider + BatchNormalization for stability
+        tf.keras.layers.Dense(128),
+        tf.keras.layers.BatchNormalization(),
+        tf.keras.layers.Activation('relu'),
         tf.keras.layers.Dropout(0.3),
+
+        # Layer 2: Deep feature extraction
+        tf.keras.layers.Dense(64),
+        tf.keras.layers.BatchNormalization(),
+        tf.keras.layers.Activation('relu'),
+        tf.keras.layers.Dropout(0.3),
+
+        # Layer 3: Bottleneck
         tf.keras.layers.Dense(32, activation='relu'),
+        
+        # Output Layer
         tf.keras.layers.Dense(1, activation='sigmoid')
     ])
+    
+    model.compile(
+        optimizer = tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss = "binary_crossentropy",
+        metrics=[
+            'accuracy',
+            tf.keras.metrics.AUC(name='auc'),       
+            tf.keras.metrics.Recall(name='recall'), 
+        ]
+    )
+    
+    #8. Callbacks (The Auto-Pilot)
+    
+    callbacks = [
+        tf.keras.callback.EarlyStopping(monitor = 'val_loss',patiencs=10,restore_best_weights=True,verbose=1),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss',factor=0.5,patience=5,min_lr=0.00001,verbose=1)
+    ]
+    
+    # 9. Train with Class Weights
+    print("Starting Training...")
+    history = model.fit(
+        X_train_processed, 
+        y_train, 
+        epochs=100,            
+        batch_size=32, 
+        validation_split=0.1, 
+        class_weight=class_weights_dict, 
+        callbacks=callbacks,
+        verbose=1
+    )
 
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-    model.fit(X_train_processed, y_train, epochs=30, batch_size=32, validation_split=0.1, verbose=1)
-
-    # 7. Save Artifacts
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
     model.save(MODEL_PATH)
     joblib.dump(preprocessor, PIPELINE_PATH)
-    print("Training Complete. Model updated using database records.")
+    
+    print("\n--- Training Complete ---")
+    print(f"Final Model saved to: {MODEL_PATH}")
+    
+    # Quick Evaluation
+    loss, acc, auc, recall = model.evaluate(X_test_processed, y_test)
+    print(f"Test Set Performance -> Accuracy: {acc:.2f}, AUC: {auc:.2f}, Recall: {recall:.2f}")
 
 if __name__ == "__main__":
     train()
