@@ -3,21 +3,46 @@ import numpy as np
 import tensorflow as tf
 import joblib
 import os
+import yaml
+import logging
+import mlflow
+import mlflow.keras
 from pymongo import MongoClient
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
+from sklearn.utils.class_weight import compute_class_weight
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+CONFIG_PATH = "config.yaml"
+if not os.path.exists(CONFIG_PATH):
+    logger.error(f"Configuration file {CONFIG_PATH} not found!")
+    raise FileNotFoundError(f"{CONFIG_PATH} missing. Please create it.")
+
+with open(CONFIG_PATH, "r") as f:
+    config = yaml.safe_load(f)
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-DB_NAME = "telco_churn"
-COLLECTION_NAME = "training_dataset"
+DB_NAME = config['data']['db_name']
+COLLECTION_NAME = config['data']['collection']
+
+LEARNING_RATE = config['model']['learning_rate']
+BATCH_SIZE = config['model']['batch_size']
+EPOCHS = config['model']['epochs']
+PATIENCE = config['model']['early_stopping_patience']
 
 ARTIFACTS_DIR = 'app/artifacts'
 MODEL_PATH = os.path.join(ARTIFACTS_DIR, 'churn_model.keras')
 PIPELINE_PATH = os.path.join(ARTIFACTS_DIR, 'preprocessor.pkl')
 
 def fetch_data_from_db():
-    print("Connecting to MongoDB...")
+    logger.info("Connecting to MongoDB to fetch raw data...")
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
     collection = db[COLLECTION_NAME]
@@ -26,116 +51,114 @@ def fetch_data_from_db():
     client.close()
     
     if not data:
-        raise ValueError("Database is empty! Run seed_db.py first.")
+        logger.error("Database is empty! Run seed_db.py first.")
+        raise ValueError("Database is empty!")
         
-    print(f"Fetched {len(data)} records from database.")
+    logger.info(f"Successfully fetched {len(data)} records from database.")
     return pd.DataFrame(data)
 
 def train():
-    # 1. Load Data from DB
-    df = fetch_data_from_db()
-
-    # 2. Data Cleaning 
-    df['TotalCharges'] = pd.to_numeric(df['TotalCharges'], errors='coerce').fillna(0)
+    mlflow.set_tracking_uri(config['experiment']['tracking_uri'])
+    mlflow.set_experiment(config['experiment']['name'])
     
-    # Ensure Churn is integer (1/0)
-    if df['Churn'].dtype == 'object':
-         df['Churn'] = df['Churn'].map({'Yes': 1, 'No': 0})
-    
-    # Drop IDs if they exist
-    if 'customerID' in df.columns:
-        df.drop('customerID', axis=1, inplace=True)
-
-    
-
-    X = df.drop('Churn', axis=1)
-    y = df['Churn']
-
-    # 4. Pipeline Definitions
-    numerical_features = ['tenure', 'MonthlyCharges', 'TotalCharges']
-    categorical_features = [col for col in X.columns if col not in numerical_features]
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('num', StandardScaler(), numerical_features),
-            ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_features)
-        ]
-    )
-
-    # 5. Split & Train
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    X_train_processed = preprocessor.fit_transform(X_train)
-    X_test_processed = preprocessor.transform(X_test)
-
-    class_weights = class_weights.compute_class_weight(class_weights="balanced",classes=np.unique(y_train),y=y_train)
-    
-    class_weights_dict = dict(enumerate(class_weights))
-    print(f"Computed Class Weights:{class_weights_dict}")
-    
-    model = tf.keras.models.Sequential([
-        # Input Layer
-        tf.keras.layers.Input(shape=(X_train_processed.shape[1],)),
+    with mlflow.start_run():
+        logger.info("Started MLflow tracking run.")
         
-        # Layer 1: Wider + BatchNormalization for stability
-        tf.keras.layers.Dense(128),
-        tf.keras.layers.BatchNormalization(),
-        tf.keras.layers.Activation('relu'),
-        tf.keras.layers.Dropout(0.3),
+        # Log hyperparameters to MLflow
+        mlflow.log_params({
+            "learning_rate": LEARNING_RATE,
+            "batch_size": BATCH_SIZE,
+            "epochs": EPOCHS,
+            "patience": PATIENCE
+        })
 
-        # Layer 2: Deep feature extraction
-        tf.keras.layers.Dense(64),
-        tf.keras.layers.BatchNormalization(),
-        tf.keras.layers.Activation('relu'),
-        tf.keras.layers.Dropout(0.3),
+        # Load Data
+        df = fetch_data_from_db()
 
-        # Layer 3: Bottleneck
-        tf.keras.layers.Dense(32, activation='relu'),
+        # Data Cleaning
+        logger.info("Processing data and handling missing values...")
+        df['TotalCharges'] = pd.to_numeric(df['TotalCharges'], errors='coerce')
+        df['TotalCharges'] = df['TotalCharges'].fillna(df['TotalCharges'].median())
+        df['Churn'] = df['Churn'].map({'Yes': 1, 'No': 0})
         
-        # Output Layer
-        tf.keras.layers.Dense(1, activation='sigmoid')
-    ])
-    
-    model.compile(
-        optimizer = tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss = "binary_crossentropy",
-        metrics=[
-            'accuracy',
-            tf.keras.metrics.AUC(name='auc'),       
-            tf.keras.metrics.Recall(name='recall'), 
-        ]
-    )
-    
-    #8. Callbacks (The Auto-Pilot)
-    
-    callbacks = [
-        tf.keras.callback.EarlyStopping(monitor = 'val_loss',patiencs=10,restore_best_weights=True,verbose=1),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss',factor=0.5,patience=5,min_lr=0.00001,verbose=1)
-    ]
-    
-    # 9. Train with Class Weights
-    print("Starting Training...")
-    history = model.fit(
-        X_train_processed, 
-        y_train, 
-        epochs=100,            
-        batch_size=32, 
-        validation_split=0.1, 
-        class_weight=class_weights_dict, 
-        callbacks=callbacks,
-        verbose=1
-    )
+        X = df.drop(['Churn', 'customerID'], axis=1, errors='ignore')
+        y = df['Churn']
+        
+        # Identify column types
+        numeric_features = X.select_dtypes(include=['int64', 'float64']).columns
+        categorical_features = X.select_dtypes(include=['object']).columns
 
-    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
-    model.save(MODEL_PATH)
-    joblib.dump(preprocessor, PIPELINE_PATH)
-    
-    print("\n--- Training Complete ---")
-    print(f"Final Model saved to: {MODEL_PATH}")
-    
-    # Quick Evaluation
-    loss, acc, auc, recall = model.evaluate(X_test_processed, y_test)
-    print(f"Test Set Performance -> Accuracy: {acc:.2f}, AUC: {auc:.2f}, Recall: {recall:.2f}")
+        # Preprocessing Pipeline (Pillar 3 preparation)
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', StandardScaler(), numeric_features),
+                ('cat', OneHotEncoder(drop='first', handle_unknown='ignore'), categorical_features)
+            ])
+
+        X_processed = preprocessor.fit_transform(X)
+        X_train, X_test, y_train, y_test = train_test_split(X_processed, y, test_size=0.2, random_state=42)
+
+        # Compute Class Weights for Imbalanced Data
+        classes = np.unique(y_train)
+        weights = compute_class_weight('balanced', classes=classes, y=y_train)
+        class_weights_dict = dict(zip(classes, weights))
+
+        # Build Neural Network
+        logger.info("Compiling Keras model...")
+        model = tf.keras.Sequential([
+            tf.keras.layers.Dense(64, activation='relu', input_shape=(X_train.shape[1],)),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.Dense(32, activation='relu'),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(1, activation='sigmoid') # Output Layer
+        ])
+        
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+            loss="binary_crossentropy",
+            metrics=['accuracy', tf.keras.metrics.AUC(name='auc'), tf.keras.metrics.Recall(name='recall')]
+        )
+        
+        keras_callbacks = [
+            tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=PATIENCE, restore_best_weights=True, verbose=1),
+            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.00001, verbose=1)
+        ]
+        
+        # Train Model
+        logger.info(f"Starting Training for {EPOCHS} epochs...")
+        history = model.fit(
+            X_train, 
+            y_train, 
+            epochs=EPOCHS,            
+            batch_size=BATCH_SIZE, 
+            validation_split=0.1, 
+            class_weight=class_weights_dict, 
+            callbacks=keras_callbacks,
+            verbose=1
+        )
+
+        # Evaluate Model
+        logger.info("Evaluating model on test data...")
+        loss, accuracy, auc, recall = model.evaluate(X_test, y_test, verbose=0)
+        logger.info(f"Evaluation Results -> Accuracy: {accuracy:.4f}, AUC: {auc:.4f}, Recall: {recall:.4f}")
+        
+        # Log Metrics to MLflow
+        mlflow.log_metrics({
+            "test_loss": loss,
+            "test_accuracy": accuracy,
+            "test_auc": auc,
+            "test_recall": recall
+        })
+
+        # Save Artifacts
+        os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+        model.save(MODEL_PATH)
+        joblib.dump(preprocessor, PIPELINE_PATH)
+        
+        mlflow.keras.log_model(model, "keras_model")
+        mlflow.log_artifact(PIPELINE_PATH, "preprocessor")
+
+        logger.info("Training complete. Artifacts saved locally and tracked in MLflow.")
 
 if __name__ == "__main__":
     train()
