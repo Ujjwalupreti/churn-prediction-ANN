@@ -1,0 +1,13 @@
+experiment:
+  name: "telco_churn_prediction"
+  tracking_uri: "http://localhost:5000" 
+
+data:
+  db_name: "telco_churn"
+  collection: "training_dataset"
+
+model:
+  learning_rate: 0.001
+  batch_size: 32
+  epochs: 100
+  early_stopping_patience: 10
