@@ -1,3 +1,4 @@
+setuptools
 fastapi
 uvicorn
 tensorflow
@@ -7,3 +8,5 @@ numpy
 pydantic
 joblib
 python-multipart
+pymongo
+mlflow
